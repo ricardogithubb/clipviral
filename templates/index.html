@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="pt-br" data-bs-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ViralClip Generator</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  </head>
+  <body class="bg-body">
+    <nav class="navbar navbar-expand-lg border-bottom">
+      <div class="container-fluid">
+        <span class="navbar-brand fw-bold">🎬 ViralClip <span class="text-secondary">Generator</span></span>
+      </div>
+    </nav>
+
+    <main class="container py-4">
+      <div class="row g-4">
+        <div class="col-12 col-lg-5">
+          <div class="card shadow-lg border-0 rounded-4 overflow-hidden">
+            <div class="card-body p-4">
+              <h5 class="card-title mb-3">Upload do vídeo</h5>
+              <div id="dropzone" class="dropzone text-center p-5 mb-3">
+                <p class="mb-1">Arraste seu vídeo aqui</p>
+                <small class="text-secondary">ou clique para selecionar</small>
+                <input type="file" id="fileInput" accept="video/*" hidden>
+              </div>
+              <button class="btn btn-primary w-100" id="btnSelect">Selecionar arquivo</button>
+              <div class="mt-3 small text-secondary" id="uploadInfo"></div>
+
+              <div class="progress mt-3 d-none" id="progUpload">
+                <div class="progress-bar" role="progressbar" style="width: 0%"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-lg-7">
+          <div class="card shadow-lg border-0 rounded-4">
+            <div class="card-body p-4">
+              <h5 class="card-title">Propostas de cortes (IA)</h5>
+              <p class="text-secondary mb-2 small">Após o upload, clique em <b>Gerar cortes</b>. Edite clicando em <b>Editar</b>.</p>
+              <div class="d-flex gap-2 mb-3 flex-wrap">
+                <button id="btnAnalyze" class="btn btn-outline-primary" disabled>Gerar cortes</button>
+                <button id="btnRender" class="btn btn-success" disabled>Renderizar 9:16</button>
+                <button id="btnZip" class="btn btn-outline-light" disabled>Baixar ZIP</button>
+              </div>
+
+              <div id="proposals" class="list-group small"></div>
+
+              <div class="mt-3 d-none" id="renderProgressWrap">
+                <label class="form-label">Progresso</label>
+                <div class="progress">
+                  <div class="progress-bar" id="renderProgress" style="width:0%">0%</div>
+                </div>
+                <div id="renderMsg" class="small text-secondary mt-1"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Modal Editor -->
+    <div class="modal fade" id="editorModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content rounded-4 border-0">
+          <div class="modal-header">
+            <h5 class="modal-title">Editor do Corte <span id="modalClipTitle"></span></h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <div class="row g-4">
+              <div class="col-12 col-lg-7">
+                <div class="ratio ratio-16x9 rounded-3 overflow-hidden border">
+                  <video id="editorVideo" controls></video>
+                </div>
+                <div class="mt-3">
+                  <label class="form-label small">Tempo no clipe: <span id="curTimeLabel">0.0s</span></label>
+                  <input type="range" class="form-range" id="timeSlider" min="0" max="60" step="0.1" value="0">
+                </div>
+              </div>
+              <div class="col-12 col-lg-5">
+                <div class="card bg-transparent border rounded-4">
+                  <div class="card-body">
+                    <h6 class="mb-3">Keyframes de Enquadramento</h6>
+                    <div class="row g-2 align-items-end">
+                      <div class="col-4">
+                        <label class="form-label small">X (0–1)</label>
+                        <input type="number" class="form-control form-control-sm" id="kfX" min="0" max="1" step="0.01" value="0.5">
+                      </div>
+                      <div class="col-4">
+                        <label class="form-label small">Y (0–1)</label>
+                        <input type="number" class="form-control form-control-sm" id="kfY" min="0" max="1" step="0.01" value="0.4">
+                      </div>
+                      <div class="col-4">
+                        <label class="form-label small">Tempo (s)</label>
+                        <input type="number" class="form-control form-control-sm" id="kfT" min="0" max="60" step="0.1" value="0">
+                      </div>
+                      <div class="col-12 d-grid mt-2">
+                        <button class="btn btn-outline-primary btn-sm" id="btnAddKf">Adicionar keyframe</button>
+                      </div>
+                    </div>
+                    <div class="mt-3">
+                      <ul class="list-group" id="kfList"></ul>
+                    </div>
+                    <hr>
+                    <div class="row g-2">
+                      <div class="col-6">
+                        <label class="form-label small">Início (s)</label>
+                        <input type="number" class="form-control form-control-sm" id="clipStart" min="0" step="0.1">
+                      </div>
+                      <div class="col-6">
+                        <label class="form-label small">Fim (s)</label>
+                        <input type="number" class="form-control form-control-sm" id="clipEnd" min="0" step="0.1">
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+            <button class="btn btn-primary" id="btnSaveEdit">Salvar alterações</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+/* Minimal dark, suaves sombras e cantos arredondados */
+body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans"; }
+.navbar { background: rgba(22,22,26,.6); backdrop-filter: blur(6px); }
+.dropzone { border: 2px dashed rgba(255,255,255,.2); border-radius: 1rem; cursor: pointer; transition: .2s ease; }
+.dropzone:hover { border-color: rgba(255,255,255,.35); background: rgba(255,255,255,.03); }
+.card { background: linear-gradient(180deg, rgba(28,28,34,1) 0%, rgba(20,20,24,1) 100%); }
+.list-group-item { background: rgba(255,255,255,.02); border: 1px solid rgba(255,255,255,.06); }
+.btn { border-radius: 12px; }
+.progress { height: 10px; border-radius: 12px; }
+.progress-bar { border-radius: 12px; }
+#kfList .badge { min-width: 42px; }
