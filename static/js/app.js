@@ -34,8 +34,22 @@ $(document).ready(function () {
   const btnSaveEdit = $("#btnSaveEdit");
   const modalClipTitle = $("#modalClipTitle");
 
+  // Timeline custom
+  const timelineWrapper = $("#timelineWrapper");
+  const handleStart = $("#handleStart");
+  const handleEnd = $("#handleEnd");
+  const selection = $("#selection");
+  const rangeStartLabel = $("#rangeStartLabel");
+  const rangeEndLabel = $("#rangeEndLabel");
+  const btnPreviewCut = $("#btnPreviewCut");
+
+  const btnYoutube = $("#btnYoutube");
+  const youtubeUrl = $("#youtubeUrl");
+
   let currentEditingClip = null;
   let currentKeyframes = [];
+  let videoDuration = 0;
+  let draggingHandle = null;
 
   // --------- Upload ---------
   btnSelect.on("click", () => fileInput.click());
@@ -60,6 +74,58 @@ $(document).ready(function () {
       handleFileUpload(e.target.files[0]);
     }
   });
+
+  //---------- Upload YouTube ---------
+btnYoutube.on("click", function () {
+  const url = youtubeUrl.val().trim();
+  if (!url) {
+    alert("Cole um link válido do YouTube.");
+    return;
+  }
+
+  uploadInfo.text("Iniciando download do YouTube...");
+  btnAnalyze.prop("disabled", true);
+  btnRender.prop("disabled", true);
+  btnZip.prop("disabled", true);
+  proposalsContainer.empty();
+
+  $.ajax({
+    url: "/upload_youtube",
+    type: "POST",
+    contentType: "application/json",
+    data: JSON.stringify({ url }),
+    success: function (response) {
+      const sessionId = response.session_id;
+      const evtSource = new EventSource(`/youtube_status/${sessionId}`);
+
+      evtSource.onmessage = function (event) {
+        const data = JSON.parse(event.data);
+        uploadInfo.text(data.message);
+
+        if (data.status === "done") {
+          // 🔧 corrigido: usar o caminho completo em vez de só o nome
+          uploadedFilePath = data.filepath;  
+          console.log("Download concluído:", uploadedFilePath);
+
+          btnAnalyze.prop("disabled", false);
+          evtSource.close();
+        }
+
+        if (data.status === "error") {
+          alert("Erro ao baixar: " + data.message);
+          evtSource.close();
+        }
+      };
+    },
+    error: function (xhr) {
+      alert("Erro ao iniciar download do YouTube: " + (xhr.responseJSON?.error || "desconhecido"));
+    }
+  });
+});
+
+
+
+  
 
   function handleFileUpload(file) {
     if (!file.type.match("video.*")) {
@@ -133,6 +199,8 @@ $(document).ready(function () {
       alert("Faça o upload do arquivo antes de analisar.");
       return;
     }
+
+    console.log("Analisando:", uploadedFilePath);
 
     btnAnalyze.prop("disabled", true);
     btnAnalyze.html(
@@ -219,13 +287,24 @@ $(document).ready(function () {
 
     modalClipTitle.text(`#${proposals.findIndex((p) => p.id === clip.id) + 1}`);
     editorVideo.src = URL.createObjectURL(currentFile);
+
     editorVideo.onloadedmetadata = function () {
-      timeSlider.attr("max", (clip.end - clip.start).toFixed(1));
-      // tempos relativos ao início do clipe
+      videoDuration = editorVideo.duration;
+
+      // inicia handles no corte atual
+      const startPercent = (clip.start / videoDuration) * 100;
+      const endPercent = (clip.end / videoDuration) * 100;
+
+      handleStart.css("left", startPercent + "%");
+      handleEnd.css("left", endPercent + "%");
+      updateSelection();
+
       clipStart.val(clip.start.toFixed(1));
       clipEnd.val(clip.end.toFixed(1));
+
+      timeSlider.attr("max", videoDuration.toFixed(1));
       editorVideo.currentTime = clip.start;
-      timeSlider.val(0);
+      timeSlider.val(clip.start.toFixed(1));
       updateTimeLabel();
     };
 
@@ -235,32 +314,111 @@ $(document).ready(function () {
 
   function updateTimeLabel() {
     const rel = parseFloat(timeSlider.val() || "0");
-    curTimeLabel.text(`${rel.toFixed(1)}s`);
-    kfT.val(rel.toFixed(1)); // SALVANDO tempo RELATIVO ao clipe
+    kfT.val(rel.toFixed(1));
   }
 
   timeSlider.on("input", function () {
-    // controla video por tempo absoluto
     if (editorVideo && currentEditingClip) {
       const rel = parseFloat(timeSlider.val());
-      editorVideo.currentTime = currentEditingClip.start + rel;
+      editorVideo.currentTime = rel;
       updateTimeLabel();
     }
   });
 
   editorVideo.addEventListener("timeupdate", function () {
-    if (!timeSlider.is(":focus") && currentEditingClip) {
-      const rel = editorVideo.currentTime - currentEditingClip.start;
-      timeSlider.val(Math.max(0, Math.min(rel, currentEditingClip.end - currentEditingClip.start)).toFixed(1));
+    if (!timeSlider.is(":focus")) {
+      timeSlider.val(editorVideo.currentTime.toFixed(1));
       updateTimeLabel();
     }
+  });
+
+  function secondsToHMS(totalSeconds) {
+    totalSeconds = Math.floor(totalSeconds); // arredonda pra baixo
+    const hours   = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    // formata sempre com 2 dígitos
+    const hh = hours.toString().padStart(2, '0');
+    const mm = minutes.toString().padStart(2, '0');
+    const ss = seconds.toString().padStart(2, '0');
+
+    return `${hh}:${mm}:${ss}`;
+}
+
+
+  function updateSelection() {
+    const startPx = handleStart.position().left;
+    const endPx = handleEnd.position().left;
+    const barWidth = timelineWrapper.width();
+
+    const startTime = (startPx / barWidth) * videoDuration;
+    const endTime = (endPx / barWidth) * videoDuration;
+
+    selection.css({
+      left: startPx + "px",
+      width: endPx - startPx + "px",
+    });
+
+    clipStart.val(startTime.toFixed(1));
+    clipEnd.val(endTime.toFixed(1));
+
+    rangeStartLabel.text(secondsToHMS(startTime));
+    rangeEndLabel.text(secondsToHMS(endTime));
+
+    curTimeLabel.text((endTime-startTime).toFixed(1) + "s");
+  }
+
+  // Drag handles
+  $(".handle").on("mousedown", function (e) {
+    draggingHandle = $(this);
+    e.preventDefault();
+  });
+
+  $(document).on("mousemove", function (e) {
+    if (!draggingHandle) return;
+
+    const wrapperOffset = timelineWrapper.offset().left;
+    const wrapperWidth = timelineWrapper.width();
+    let newLeft = e.pageX - wrapperOffset;
+
+    if (draggingHandle.is(handleStart)) {
+      const maxLeft = handleEnd.position().left - 10;
+      newLeft = Math.max(0, Math.min(newLeft, maxLeft));
+    } else {
+      const minLeft = handleStart.position().left + 10;
+      newLeft = Math.max(minLeft, Math.min(newLeft, wrapperWidth));
+    }
+
+    draggingHandle.css("left", newLeft + "px");
+    updateSelection();
+  });
+
+  $(document).on("mouseup", function () {
+    draggingHandle = null;
+  });
+
+  // Preview corte
+  btnPreviewCut.on("click", function () {
+    const start = parseFloat(clipStart.val());
+    const end = parseFloat(clipEnd.val());
+    editorVideo.currentTime = start;
+    editorVideo.play();
+
+    const stopPlayback = () => {
+      if (editorVideo.currentTime >= end) {
+        editorVideo.pause();
+        editorVideo.removeEventListener("timeupdate", stopPlayback);
+      }
+    };
+    editorVideo.addEventListener("timeupdate", stopPlayback);
   });
 
   btnAddKf.on("click", addKeyframe);
   function addKeyframe() {
     const x = parseFloat(kfX.val());
     const y = parseFloat(kfY.val());
-    const t = parseFloat(kfT.val()); // RELATIVO
+    const t = parseFloat(kfT.val());
     if ([x, y, t].some((v) => Number.isNaN(v))) {
       alert("Valores inválidos para keyframe");
       return;
@@ -307,7 +465,6 @@ $(document).ready(function () {
       return;
     }
 
-    // Atualiza proposta (keyframes já estão RELATIVOS ao início do clip)
     const proposalIndex = proposals.findIndex((p) => p.id === currentEditingClip.id);
     if (proposalIndex !== -1) {
       proposals[proposalIndex].start = start;
@@ -379,7 +536,6 @@ $(document).ready(function () {
         renderProgress.text(`${total}%`);
         renderMsg.text(message);
 
-        // Atualiza badges individuais (por clip)
         if (data.clips) {
           Object.entries(data.clips).forEach(([clipId, info]) => {
             const pct = info.percent ?? 0;
@@ -393,7 +549,6 @@ $(document).ready(function () {
           renderMsg.html('<span class="text-success">Renderização concluída!</span>');
           btnZip.prop("disabled", false);
 
-          // Adiciona botões/players se ainda não existirem
           proposalsContainer.find(".list-group-item").each(function () {
             const clipId = $(this).data("clip-id");
             if ($(this).find(".btn-outline-success").length === 0) {

@@ -13,6 +13,7 @@ import threading
 import subprocess
 from datetime import datetime
 from typing import List, Dict, Any
+import yt_dlp
 
 from flask import Flask, render_template, request, jsonify, send_from_directory, Response
 from werkzeug.utils import secure_filename
@@ -42,7 +43,6 @@ app.config.update(
 )
 
 # ------------------ PROGRESS / SESSIONS ------------------
-# Estrutura:
 # progress_store[session_id] = {
 #   "status": "idle|running|done|error",
 #   "message": "...",
@@ -76,7 +76,6 @@ def ffprobe_json(video_path: str) -> Dict[str, Any]:
 
 
 def downmix_audio_pcm16(video_path: str, out_wav: str, sr: int = 22050):
-    # Rápido e leve: mono, 16-bit, sample rate menor
     cmd = [
         "ffmpeg",
         "-y",
@@ -95,16 +94,11 @@ def downmix_audio_pcm16(video_path: str, out_wav: str, sr: int = 22050):
 
 
 def read_wav_as_np_int16(path: str) -> np.ndarray:
-    # Leitura simples sem libs pesadas: usa numpy.frombuffer + wave header via ffmpeg (já garantido como pcm_s16le)
     with open(path, "rb") as f:
         raw = f.read()
-    # ignorar header WAV: procure "data" chunk e leia o payload
-    # WAV simples: não vamos implementar um parser completo; como é gerado pelo ffmpeg, o chunk 'data' aparece uma única vez
-    # Encontra índice do b"data"
     idx = raw.find(b"data")
     if idx == -1:
         return np.array([], dtype=np.int16)
-    # payload size são 4 bytes após 'data'
     size = int.from_bytes(raw[idx + 4: idx + 8], "little", signed=False)
     start = idx + 8
     payload = raw[start: start + size]
@@ -116,7 +110,6 @@ def moving_rms(x: np.ndarray, win: int) -> np.ndarray:
     if len(x) == 0 or win <= 1:
         return np.array([], dtype=np.float32)
     x = x.astype(np.float32)
-    # RMS janela deslizante (raiz da média dos quadrados)
     cumsum = np.cumsum(np.insert(x * x, 0, 0))
     window_sum = cumsum[win:] - cumsum[:-win]
     rms = np.sqrt(window_sum / win)
@@ -128,23 +121,13 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def build_piecewise_linear_expr(points: List[Dict[str, float]], axis: str, cw_expr: str, ch_expr: str) -> str:
-    """
-    Constrói expressão FFmpeg para pan (x ou y) com interpolação linear entre keyframes.
-    points: [{"t":sec_rel, "x":0..1, "y":0..1}, ...] - tempos relativos ao início do corte!
-    axis: "x" ou "y"
-    cw_expr: expr do crop width (ex.: "ih*9/16")
-    ch_expr: expr do crop height (ex.: "ih")
-    Retorna expressão que calcula posição em pixels.
-    """
     if not points:
-        # centralizado por padrão
         if axis == "x":
             base = f"(iw-({cw_expr}))/2"
         else:
             base = f"(ih-({ch_expr}))/2"
         return base
 
-    # Ordena e remove duplicados de tempo
     pts = sorted(points, key=lambda p: p["t"])
     filtered = []
     last_t = None
@@ -155,34 +138,27 @@ def build_piecewise_linear_expr(points: List[Dict[str, float]], axis: str, cw_ex
             last_t = t
     pts = filtered
 
-    # Converte 0..1 para pixels depois multiplicando por (iw-cw) ou (ih-ch)
     span_expr = f"(iw-({cw_expr}))" if axis == "x" else f"(ih-({ch_expr}))"
 
-    # Se só 1 ponto: manter fixo
     if len(pts) == 1:
         v = clamp(float(pts[0][axis]), 0.0, 1.0)
         return f"({span_expr})*{v}"
 
-    # Monta expressão piecewise com if() e between()
     pieces = []
     for i in range(len(pts) - 1):
         t0 = float(pts[i]["t"])
         t1 = float(pts[i + 1]["t"])
         v0 = clamp(float(pts[i][axis]), 0.0, 1.0)
         v1 = clamp(float(pts[i + 1][axis]), 0.0, 1.0)
-        # lerp: v0 + (t - t0) * (v1 - v0) / (t1 - t0)
         expr_v = f"({v0}+((t-{t0})*({v1}-{v0})/({t1}-{t0})))"
         pieces.append(f"between(t,{t0},{t1})*(({span_expr})*{expr_v})")
 
-    # Antes do primeiro e depois do último, mantém o valor extremo
     v_first = clamp(float(pts[0][axis]), 0.0, 1.0)
     v_last = clamp(float(pts[-1][axis]), 0.0, 1.0)
     expr_first = f"(t<{pts[0]['t']})*(({span_expr})*{v_first})"
     expr_last = f"(t>{pts[-1]['t']})*(({span_expr})*{v_last})"
 
-    # Soma das regiões (as between() são mutuamente exclusivas nas bordas)
     full_expr = "+".join([expr_first] + pieces + [expr_last])
-    # Clampeia (segurança)
     if axis == "x":
         return f"clip({full_expr},0,iw-({cw_expr}))"
     else:
@@ -211,19 +187,11 @@ def remove_metadata(input_path: str, output_path: str) -> bool:
 
 
 def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
-    """
-    Estratégia leve:
-      - Duração via ffprobe
-      - Áudio downmix PCM16 22.05kHz -> RMS móvel para achar picos (refrões/pontos altos)
-      - Vídeo 1 FPS reduzido para 320px largura -> contagem de faces (dá peso para 'protagonista')
-    Gera propostas de até ~10 cortes de 60s (sem sobreposição), ordenados por score áudio*faces.
-    """
     meta = ffprobe_json(video_path)
     duration = float(meta["format"]["duration"])
     if duration <= 0:
         return []
 
-    # ---- ÁUDIO ----
     wav_tmp = os.path.join(TMP_FOLDER, f"{uuid.uuid4().hex}.wav")
     try:
         downmix_audio_pcm16(video_path, wav_tmp, sr=22050)
@@ -234,27 +202,23 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    # RMS móvel em janelas de ~0.2s
     sr = 22050
     win = max(1, int(0.2 * sr))
     rms = moving_rms(samples, win)
     if rms.size == 0:
         rms = np.zeros(1, dtype=np.float32)
-    # timestamps dos rms (em segundos) alinhados com o centro da janela
     rms_t = np.arange(len(rms)) * (1.0 / sr) + (win / (2 * sr))
 
-    # Normaliza RMS
     if rms.max() > 0:
         rms_norm = rms / rms.max()
     else:
         rms_norm = rms
 
-    # ---- VÍDEO / ROSTOS (1 FPS, 320px largura) ----
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (duration * fps))
-    frame_interval = int(fps)  # 1 fps
+    frame_interval = int(fps)
     face_times = []
     face_scores = []
 
@@ -263,7 +227,6 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
         ok, frame = cap.read()
         if not ok:
             continue
-        # redimensiona mantendo proporção para largura 320
         h, w = frame.shape[:2]
         new_w = 320
         new_h = int(h * (new_w / w))
@@ -272,19 +235,17 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
         faces = face_cascade.detectMultiScale(gray, 1.1, 4)
         timestamp = i / fps
         face_times.append(timestamp)
-        face_scores.append(min(5, len(faces)))  # clamp de segurança
+        face_scores.append(min(5, len(faces)))
 
     cap.release()
     faces_arr = np.array(face_scores, dtype=np.float32)
     face_t = np.array(face_times, dtype=np.float32)
 
-    # Interpola faces para o tempo do RMS
     if len(faces_arr) > 1:
         faces_interp = np.interp(rms_t, face_t, faces_arr)
     else:
         faces_interp = np.zeros_like(rms_t)
 
-    # Score combinado (peso 0.7 áudio, 0.3 faces)
     if faces_interp.max() > 0:
         faces_norm = faces_interp / faces_interp.max()
     else:
@@ -292,10 +253,9 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
 
     score = 0.7 * rms_norm + 0.3 * faces_norm
 
-    # Busca picos locais e gera janelas de 60s em torno deles
     clip_len = 60.0
-    max_clips = max(1, min(10, int(duration // 15)))  # adaptativo
-    peaks_idx = score.argsort()[::-1]  # maiores primeiro
+    max_clips = max(1, min(3, int(duration // 15)))
+    peaks_idx = score.argsort()[::-1]
 
     used_intervals = []
     proposals = []
@@ -307,7 +267,6 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
         t = float(rms_t[idx])
         start = clamp(t - clip_len / 2, 0.0, max(0.0, duration - clip_len))
         end = min(start + clip_len, duration)
-        # evita sobreposição grande com janelas já escolhidas
         candidate = (start, end)
         if any(overlaps(candidate, u) for u in used_intervals):
             continue
@@ -318,14 +277,12 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
                 "start": float(start),
                 "end": float(end),
                 "score": float(score[idx]),
-                # sem keyframes inicialmente
             }
         )
         used_intervals.append(candidate)
         if len(proposals) >= max_clips:
             break
 
-    # fallback se não encontrou nada
     if not proposals:
         n = int(math.ceil(duration / clip_len))
         for i in range(min(10, n)):
@@ -337,19 +294,9 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
 
 
 def build_crop_filter_916_with_keyframes(start: float, end: float, keyframes: List[Dict[str, float]]) -> str:
-    """
-    Gera filtro:
-      - Primeiro recorta para 9:16 com 'crop=cw:ch:x:y'
-      - Aplica pan (x,y) com base nos keyframes normalizados (0..1) e timestamps (relativos ao corte!)
-      - Depois escala para 1080x1920
-    Observação importante: no grafo, 't' começa em 0 no início do corte. Portanto,
-    os keyframes recebidos devem estar relativos ao 'start'. Se vierem absolutos, compensamos.
-    """
-    # Normaliza keyframes (se tempos são absolutos, tornam-se relativos)
     rel_kf = []
     for k in (keyframes or []):
         t = float(k.get("time", 0.0))
-        # se algum kf está depois de 'end', assumimos que são absolutos e subtraímos 'start'
         rel_t = t - start if t > end else t
         rel_kf.append({"t": clamp(rel_t, 0.0, end - start), "x": float(k.get("x", 0.5)), "y": float(k.get("y", 0.5))})
 
@@ -364,12 +311,6 @@ def build_crop_filter_916_with_keyframes(start: float, end: float, keyframes: Li
 
 
 def ffmpeg_render_clip(input_path: str, out_path: str, start: float, end: float, keyframes: List[Dict[str, float]], update_cb=None):
-    """
-    Render robusto e preciso:
-      - '-ss' e '-to' APÓS o '-i' para maior precisão de corte
-      - filtro de crop+pan+scale conforme keyframes
-      - progresso real com '-progress -' (stdout)
-    """
     vf = build_crop_filter_916_with_keyframes(start, end, keyframes)
 
     cmd = [
@@ -396,20 +337,17 @@ def ffmpeg_render_clip(input_path: str, out_path: str, start: float, end: float,
         "-movflags",
         "+faststart",
         "-progress",
-        "-",  # envia progresso em stdout
+        "-",
         out_path,
     ]
 
-    # duração do corte
     cut_dur = max(0.001, float(end - start))
-
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
 
     percent = 0.0
     try:
         for line in proc.stdout:
             line = line.strip()
-            # linhas de interesse: out_time_ms=, progress=
             if line.startswith("out_time_ms="):
                 out_ms = float(line.split("=", 1)[1])
                 tcur = out_ms / 1_000_000.0
@@ -425,10 +363,6 @@ def ffmpeg_render_clip(input_path: str, out_path: str, start: float, end: float,
 
 
 def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):
-    """
-    Roda no background, processando os clipes em sequência (evita sobrecarga de CPU/GPU)
-    Atualiza progress_store[session_id] continuamente e cria o ZIP ao final.
-    """
     with progress_lock:
         progress_store[session_id] = {
             "status": "running",
@@ -453,14 +387,12 @@ def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):
             def on_progress(pct):
                 with progress_lock:
                     progress_store[session_id]["clips"][clip_id]["percent"] = round(float(pct), 2)
-                    # média simples do total
                     percs = [v["percent"] for v in progress_store[session_id]["clips"].values()]
                     progress_store[session_id]["total"] = round(sum(percs) / max(1, len(percs)), 2)
                     progress_store[session_id]["message"] = f"Renderizando {idx}/{len(clips)}..."
 
             ffmpeg_render_clip(filepath, out_path_tmp, start, end, keyframes, on_progress)
 
-            # remove metadados
             if not remove_metadata(out_path_tmp, out_path):
                 shutil.move(out_path_tmp, out_path)
             else:
@@ -472,7 +404,6 @@ def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):
             with progress_lock:
                 progress_store[session_id]["clips"][clip_id]["filename"] = f"{clip_id}.mp4"
 
-        # cria ZIP
         zip_path = os.path.join(PROCESSED_FOLDER, f"{session_id}.zip")
         import zipfile
 
@@ -502,6 +433,7 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload_file():
+    clear_uploads()
     if "file" not in request.files:
         return jsonify({"error": "No file part"}), 400
     f = request.files["file"]
@@ -511,13 +443,97 @@ def upload_file():
         return jsonify({"error": "Invalid file type"}), 400
 
     filename = secure_filename(f.filename)
-    # evitar colisão
     prefix = datetime.utcnow().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:8]
     filename_on_disk = f"{prefix}_{filename}"
     filepath = os.path.join(UPLOAD_FOLDER, filename_on_disk)
     f.save(filepath)
 
     return jsonify({"filename": filename_on_disk, "filepath": filepath})
+
+@app.route("/upload_youtube", methods=["POST"])
+def upload_youtube():
+    clear_uploads()
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "Nenhum link fornecido"}), 400
+
+    session_id = str(uuid.uuid4())
+    with progress_lock:
+        progress_store[session_id] = {
+            "status": "idle",
+            "message": "Iniciando download...",
+            "total": 0.0,
+            "filename": None,
+            "filepath": None,
+        }
+
+    def download_task():
+        try:
+            def hook(d):
+                with progress_lock:
+                    if d["status"] == "downloading":
+                        percent = d.get("_percent_str", "0%")
+                        progress_store[session_id]["status"] = "running"
+                        progress_store[session_id]["message"] = f"Baixando... {percent}"
+                        progress_store[session_id]["total"] = float(d.get("_percent", 0.0)) * 100
+                    elif d["status"] == "finished":
+                        # 🔧 Corrigido: garantir que aponta para o arquivo final .mp4
+                        vid_id = d.get("info_dict", {}).get("id")
+                        final_path = os.path.join(UPLOAD_FOLDER, f"{vid_id}.mp4")
+                        progress_store[session_id]["status"] = "done"
+                        progress_store[session_id]["message"] = "Download concluído."
+                        progress_store[session_id]["filename"] = os.path.basename(final_path)
+                        progress_store[session_id]["filepath"] = final_path
+
+            ydl_opts = {
+                "outtmpl": os.path.join(UPLOAD_FOLDER, "%(id)s.%(ext)s"),
+                "format": "bestvideo+bestaudio/best",
+                "merge_output_format": "mp4",
+                "retries": 10,
+                "fragment_retries": 10,
+                "concurrent_fragment_downloads": 3,
+                "progress_hooks": [hook],
+                "no_color": True,
+                "prefer_ffmpeg": True,
+                "ffmpeg_location": "/usr/bin/ffmpeg",
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            print("Erro no yt-dlp:", e)  # log debug
+            with progress_lock:
+                progress_store[session_id]["status"] = "error"
+                progress_store[session_id]["message"] = str(e)
+
+    t = threading.Thread(target=download_task, daemon=True)
+    t.start()
+
+    return jsonify({
+        "session_id": session_id,
+        "filepath": progress_store[session_id]["filepath"]
+    })
+
+
+
+
+@app.route("/youtube_status/<session_id>")
+def youtube_status(session_id: str):
+    def stream():
+        while True:
+            with progress_lock:
+                state = progress_store.get(session_id)
+                if not state:
+                    payload = {"status": "unknown", "total": 0}
+                else:
+                    payload = state.copy()
+            yield f"data: {json.dumps(payload)}\n\n"
+
+            if state and state.get("status") in ("done", "error"):
+                break
+            time.sleep(0.5)
+
+    return Response(stream(), mimetype="text/event-stream")
 
 
 @app.route("/analyze", methods=["POST"])
@@ -532,6 +548,7 @@ def analyze():
         return jsonify({"proposals": proposals})
     except Exception as e:
         return jsonify({"proposals": [], "error": str(e)}), 200
+        
 
 
 @app.route("/render", methods=["POST"])
@@ -549,16 +566,39 @@ def render():
     with progress_lock:
         progress_store[session_id] = {"status": "idle", "message": "Aguardando...", "clips": {}, "total": 0.0}
 
-    # roda em background para não bloquear a requisição
     t = threading.Thread(target=render_session, args=(session_id, filepath, clips), daemon=True)
     t.start()
 
     return jsonify({"session_id": session_id})
 
 
+@app.route("/render_single", methods=["POST"])
+def render_single():
+    """
+    Renderiza APENAS um corte (mais responsivo para ajustes de edição).
+    Reutiliza o mesmo mecanismo de progresso por SSE.
+    """
+    data = request.get_json(silent=True) or {}
+    filepath = data.get("filepath")
+    clip = data.get("clip")
+
+    if not filepath or not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 404
+    if not isinstance(clip, dict):
+        return jsonify({"error": "Invalid clip data"}), 400
+
+    session_id = str(uuid.uuid4())
+    with progress_lock:
+        progress_store[session_id] = {"status": "idle", "message": "Aguardando...", "clips": {}, "total": 0.0}
+
+    t = threading.Thread(target=render_session, args=(session_id, filepath, [clip]), daemon=True)
+    t.start()
+
+    return jsonify({"session_id": session_id, "clip_id": clip.get("id")})
+
+
 @app.route("/render_status/<session_id>")
 def render_status(session_id: str):
-    # SSE: envia JSON incremental com progresso
     def stream():
         while True:
             with progress_lock:
@@ -569,7 +609,6 @@ def render_status(session_id: str):
                     payload = state.copy()
             yield f"data: {json.dumps(payload)}\n\n"
 
-            # termina quando done ou error
             if state and state.get("status") in ("done", "error"):
                 break
             time.sleep(0.5)
@@ -600,12 +639,22 @@ def clean_older_than(folder: str, hours: int = 6):
     for p in glob.glob(os.path.join(folder, "**"), recursive=True):
         try:
             if os.path.isdir(p):
-                # se pasta vazia e antiga, remove
                 if os.stat(p).st_mtime < cutoff and not os.listdir(p):
                     shutil.rmtree(p, ignore_errors=True)
             else:
                 if os.stat(p).st_mtime < cutoff:
                     os.remove(p)
+        except Exception:
+            pass
+
+def clear_uploads():
+    for f in os.listdir(UPLOAD_FOLDER):
+        try:
+            path = os.path.join(UPLOAD_FOLDER, f)
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
         except Exception:
             pass
 
@@ -618,12 +667,11 @@ def cleanup_worker():
             clean_older_than(TMP_FOLDER, hours=6)
         except Exception:
             pass
-        time.sleep(3600)  # a cada 1h
+        time.sleep(3600)
 
 
 threading.Thread(target=cleanup_worker, daemon=True).start()
 
 
 if __name__ == "__main__":
-    # prod: app.run(host="0.0.0.0", port=8000)
     app.run(host="0.0.0.0", debug=True)
