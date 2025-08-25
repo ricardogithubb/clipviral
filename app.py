@@ -186,7 +186,7 @@ def remove_metadata(input_path: str, output_path: str) -> bool:
         return False
 
 
-def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
+def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
     meta = ffprobe_json(video_path)
     duration = float(meta["format"]["duration"])
     if duration <= 0:
@@ -237,6 +237,11 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
         face_times.append(timestamp)
         face_scores.append(min(5, len(faces)))
 
+        # 🔥 Atualiza progresso baseado nos frames
+        if update_cb:
+            pct = (i / total_frames) * 80  # até 80% do progresso
+            update_cb(pct, f"Processando vídeo... {pct:.1f}%")
+
     cap.release()
     faces_arr = np.array(face_scores, dtype=np.float32)
     face_t = np.array(face_times, dtype=np.float32)
@@ -254,7 +259,7 @@ def analyze_video_fast(video_path: str) -> List[Dict[str, Any]]:
     score = 0.7 * rms_norm + 0.3 * faces_norm
 
     clip_len = 60.0
-    max_clips = max(1, min(3, int(duration // 15)))
+    max_clips = max(1, min(5, int(duration // 15)))
     peaks_idx = score.argsort()[::-1]
 
     used_intervals = []
@@ -488,6 +493,7 @@ def upload_youtube():
 
             ydl_opts = {
                 "outtmpl": os.path.join(UPLOAD_FOLDER, "%(id)s.%(ext)s"),
+                # 🔧 Forçar H.264 (avc1) em MP4, evita AV1
                 "format": "bestvideo+bestaudio/best",
                 "merge_output_format": "mp4",
                 "retries": 10,
@@ -497,6 +503,8 @@ def upload_youtube():
                 "no_color": True,
                 "prefer_ffmpeg": True,
                 "ffmpeg_location": "/usr/bin/ffmpeg",
+                # 🔑 Arquivo de cookies exportado do navegador
+                # "cookiefile": "/home/ubuntu/cookies.txt",
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -543,11 +551,60 @@ def analyze():
     if not filepath or not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
-    try:
-        proposals = analyze_video_fast(filepath)
-        return jsonify({"proposals": proposals})
-    except Exception as e:
-        return jsonify({"proposals": [], "error": str(e)}), 200
+    session_id = str(uuid.uuid4())
+    with progress_lock:
+        progress_store[session_id] = {
+            "status": "running",
+            "message": "Iniciando análise...",
+            "total": 0,
+            "proposals": []
+        }
+
+    def task():
+        try:
+            def on_update(pct, msg):
+                with progress_lock:
+                    progress_store[session_id]["total"] = round(pct, 2)
+                    progress_store[session_id]["message"] = msg
+
+            proposals = analyze_video_fast(filepath, update_cb=on_update)
+
+            with progress_lock:
+                progress_store[session_id]["status"] = "done"
+                progress_store[session_id]["message"] = "Análise concluída."
+                progress_store[session_id]["total"] = 100
+                progress_store[session_id]["proposals"] = proposals
+
+        except Exception as e:
+            with progress_lock:
+                progress_store[session_id]["status"] = "error"
+                progress_store[session_id]["message"] = str(e)
+
+
+    threading.Thread(target=task, daemon=True).start()
+
+    # retorna só o id, o frontend vai abrir SSE em /analyze_status/<session_id>
+    return jsonify({"session_id": session_id})
+
+
+@app.route("/analyze_status/<session_id>")
+def analyze_status(session_id: str):
+    def stream():
+        while True:
+            with progress_lock:
+                state = progress_store.get(session_id)
+                if not state:
+                    payload = {"status": "unknown", "total": 0}
+                else:
+                    payload = state.copy()
+            yield f"data: {json.dumps(payload)}\n\n"
+
+            if state and state.get("status") in ("done", "error"):
+                break
+            time.sleep(0.5)
+
+    return Response(stream(), mimetype="text/event-stream")
+
         
 
 
@@ -630,6 +687,10 @@ def download_clip(session_id, clip_id):
     if os.path.exists(clip_path):
         return send_from_directory(os.path.join(PROCESSED_FOLDER, session_id), f"{clip_id}.mp4", as_attachment=True)
     return jsonify({"error": "File not found"}), 404
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
 # --------- LIMPEZA AUTOMÁTICA ---------

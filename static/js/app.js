@@ -106,6 +106,7 @@ btnYoutube.on("click", function () {
           // 🔧 corrigido: usar o caminho completo em vez de só o nome
           uploadedFilePath = data.filepath;  
           console.log("Download concluído:", uploadedFilePath);
+          currentFile = uploadedFilePath;
 
           btnAnalyze.prop("disabled", false);
           evtSource.close();
@@ -213,20 +214,48 @@ btnYoutube.on("click", function () {
       contentType: "application/json",
       data: JSON.stringify({ filepath: uploadedFilePath }),
       success: function (response) {
-        proposals = response.proposals || [];
-        displayProposals();
-        btnAnalyze.prop("disabled", false);
-        btnAnalyze.text("Gerar cortes");
-        btnRender.prop("disabled", proposals.length === 0);
-        btnZip.prop("disabled", true);
+        const sessionId = response.session_id;
+        const evtSource = new EventSource(`/analyze_status/${sessionId}`);
+
+        evtSource.onmessage = function (event) {
+          const data = JSON.parse(event.data);
+          // console.log("Analyze progress:", data);
+
+          // Atualiza mensagem
+          uploadInfo.text(data.message || "");
+
+          // Atualiza progresso (se quiser usar barra de renderização existente)
+          if (data.total !== undefined) {
+            renderProgressWrap.removeClass("d-none");
+            renderProgress.css("width", `${data.total}%`);
+            // renderProgress.text(`${data.total}%`);
+          }
+
+          if (data.status === "done") {
+            proposals = data.proposals || [];
+            console.log("Proposals:", proposals);
+            displayProposals();
+            btnAnalyze.prop("disabled", false).text("Gerar cortes");
+            btnRender.prop("disabled", proposals.length === 0);
+            btnZip.prop("disabled", true);
+            evtSource.close();
+          }
+
+          if (data.status === "error") {
+            alert("Erro na análise: " + data.message);
+            btnAnalyze.prop("disabled", false).text("Gerar cortes");
+            evtSource.close();
+          }
+        };
       },
       error: function () {
-        alert("Erro ao analisar o vídeo.");
+        alert("Erro ao iniciar análise.");
         btnAnalyze.prop("disabled", false);
         btnAnalyze.text("Gerar cortes");
       },
     });
   }
+
 
   function displayProposals() {
     proposalsContainer.empty();
@@ -247,6 +276,7 @@ btnYoutube.on("click", function () {
         <div class="list-group-item" data-clip-id="${proposal.id}">
           <div class="d-flex justify-content-between align-items-center">
             <div>
+              <input type="checkbox" class="clip-select me-2" checked>
               <strong>Corte #${index + 1}</strong>
               <div class="text-secondary small">${startTime} → ${endTime} (${duration})</div>
             </div>
@@ -276,6 +306,8 @@ btnYoutube.on("click", function () {
   // --------- Editor ---------
   proposalsContainer.off("click", ".btn-edit").on("click", ".btn-edit", function () {
     const clipId = $(this).closest(".list-group-item").data("clip-id");
+    console.log("Editando corte:", clipId);
+    console.log("proposals:", proposals);
     const proposal = proposals.find((p) => p.id === clipId);
     if (proposal) openEditor(proposal);
   });
@@ -285,8 +317,22 @@ btnYoutube.on("click", function () {
     currentKeyframes = clip.keyframes ? [...clip.keyframes] : [];
     kfList.empty();
 
+    console.log("Editando corte:", clip);
+    console.log("currentFile:", currentFile);
+
     modalClipTitle.text(`#${proposals.findIndex((p) => p.id === clip.id) + 1}`);
-    editorVideo.src = URL.createObjectURL(currentFile);
+    // editorVideo.src = URL.createObjectURL(currentFile);
+    if (currentFile instanceof File) {
+      // Upload local → cria URL temporária
+      editorVideo.src = URL.createObjectURL(currentFile);
+    } else if (uploadedFilePath) {
+      // Arquivo do servidor (YouTube ou upload processado) → monta URL pública
+      const filename = uploadedFilePath.split("/").pop();
+      editorVideo.src = `/uploads/${filename}`;
+    } else {
+      alert("Nenhum vídeo carregado para edição.");
+      return;
+    }
 
     editorVideo.onloadedmetadata = function () {
       videoDuration = editorVideo.duration;
@@ -504,12 +550,17 @@ btnYoutube.on("click", function () {
       contentType: "application/json",
       data: JSON.stringify({
         filepath: uploadedFilePath,
-        clips: proposals.map((p) => ({
-          id: p.id,
-          start: p.start,
-          end: p.end,
-          keyframes: p.keyframes || [],
-        })),
+        clips: proposals
+          .filter((p) => {
+            const item = proposalsContainer.find(`[data-clip-id="${p.id}"]`);
+            return item.find(".clip-select").is(":checked"); // só os checados
+          })
+          .map((p) => ({
+            id: p.id,
+            start: p.start,
+            end: p.end,
+            keyframes: p.keyframes || [],
+          })),
       }),
       success: function (response) {
         currentSessionId = response.session_id;
