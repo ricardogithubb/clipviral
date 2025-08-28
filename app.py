@@ -189,6 +189,8 @@ def remove_metadata(input_path: str, output_path: str) -> bool:
 def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
     meta = ffprobe_json(video_path)
     duration = float(meta["format"]["duration"])
+    all_keyframes = []  # keyframes globais coletados
+
     if duration <= 0:
         return []
 
@@ -236,6 +238,15 @@ def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
         timestamp = i / fps
         face_times.append(timestamp)
         face_scores.append(min(5, len(faces)))
+        if len(faces) > 0:
+            # pega a face mais central (ou maior)
+            (fx, fy, fw, fh) = max(faces, key=lambda f: f[2]*f[3])
+            cx = (fx + fw/2) / new_w
+            cy = (fy + fh/2) / new_h
+            # normaliza Y (topo=0, base=1)
+            cy = cy  
+            all_keyframes.append({"t": timestamp, "x": cx, "y": cy})
+
 
         # 🔥 Atualiza progresso baseado nos frames
         if update_cb:
@@ -259,7 +270,7 @@ def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
     score = 0.7 * rms_norm + 0.3 * faces_norm
 
     clip_len = 60.0
-    max_clips = max(1, min(5, int(duration // 15)))
+    max_clips = max(1, min(3, int(duration // 15)))
     peaks_idx = score.argsort()[::-1]
 
     used_intervals = []
@@ -282,8 +293,13 @@ def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
                 "start": float(start),
                 "end": float(end),
                 "score": float(score[idx]),
+                "keyframes": [
+                    kf for kf in all_keyframes
+                    if start <= kf["t"] <= end
+                ]
             }
         )
+
         used_intervals.append(candidate)
         if len(proposals) >= max_clips:
             break

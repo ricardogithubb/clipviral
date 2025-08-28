@@ -126,6 +126,55 @@ btnYoutube.on("click", function () {
 
 
 
+//------------Keyframes ---------
+function updateCropOverlay(time = editorVideo.currentTime) {
+  if (!editorVideo.videoWidth || !editorVideo.videoHeight) return;
+
+  const videoW = editorVideo.clientWidth;
+  const videoH = editorVideo.clientHeight;
+  const cropH = videoH; // sempre altura cheia
+  const cropW = cropH * 9 / 16;
+
+  // 🔹 interpolação entre keyframes
+  let x = 0.5, y = 0.5;
+  if (currentKeyframes.length > 0) {
+    const before = [...currentKeyframes].reverse().find(kf => kf.time <= time);
+    const after = currentKeyframes.find(kf => kf.time >= time);
+
+    if (before && after && before !== after) {
+      const ratio = (time - before.time) / (after.time - before.time);
+      x = before.x + ratio * (after.x - before.x);
+      y = before.y + ratio * (after.y - before.y);
+    } else if (before) {
+      x = before.x; y = before.y;
+    } else if (after) {
+      x = after.x; y = after.y;
+    }
+  }
+
+  // converter para pixels
+  const left = (x * videoW) - cropW / 2;
+  const top = (y * videoH) - cropH / 2;
+
+  $("#cropOverlay").css({
+    left: `${Math.max(0, Math.min(videoW - cropW, left))}px`,
+    top: `${Math.max(0, Math.min(videoH - cropH, top))}px`,
+    width: `${cropW}px`,
+    height: `${cropH}px`
+  });
+}
+
+editorVideo.addEventListener("timeupdate", () => updateCropOverlay());
+timeSlider.on("input", () => updateCropOverlay(parseFloat(timeSlider.val())));
+
+btnAddKf.on("click", () => {
+  addKeyframe();
+  updateCropOverlay();
+});
+
+
+
+//--------- Fim Keyframes ---------
   
 
   function handleFileUpload(file) {
@@ -314,7 +363,12 @@ btnYoutube.on("click", function () {
 
   function openEditor(clip) {
     currentEditingClip = clip;
-    currentKeyframes = clip.keyframes ? [...clip.keyframes] : [];
+    currentKeyframes = (clip.keyframes || []).map(kf => ({
+      time: kf.time !== undefined ? kf.time : kf.t, // aceita time ou t
+      x: kf.x,
+      y: kf.y
+    }));
+
     kfList.empty();
 
     console.log("Editando corte:", clip);
@@ -478,27 +532,67 @@ btnYoutube.on("click", function () {
   }
 
   function updateKeyframesList() {
-    kfList.empty();
-    currentKeyframes.sort((a, b) => a.time - b.time).forEach((kf, index) => {
-      const item = $(`
-        <li class="list-group-item d-flex justify-content-between align-items-center py-2">
-          <div class="small">
-            <span class="badge bg-primary me-2">${index + 1}</span>
-            Tempo: ${kf.time.toFixed(1)}s | X: ${kf.x.toFixed(2)} | Y: ${kf.y.toFixed(2)}
-          </div>
-          <button class="btn btn-sm btn-outline-danger btn-remove-kf" data-index="${index}">&times;</button>
-        </li>
-      `);
-      item.find(".btn-remove-kf")
-        .off("click")
-        .on("click", function () {
-          const idx = $(this).data("index");
-          currentKeyframes.splice(idx, 1);
-          updateKeyframesList();
+      kfList.empty();
+
+      currentKeyframes
+        .sort((a, b) => a.time - b.time)
+        .forEach((kf, index) => {
+          const item = $(`
+            <li class="list-group-item d-flex justify-content-between align-items-center py-2 keyframe-item" style="cursor:pointer;">
+              <div class="d-flex gap-2 align-items-center small flex-grow-1">
+                <span class="badge bg-primary">${index + 1}</span>
+                T: <input type="number" step="0.1" class="form-control form-control-sm kf-edit-time disabled" style="width:70px" value="${kf.time.toFixed(1)}">
+                X: <input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm kf-edit-x" style="width:70px" value="${kf.x.toFixed(2)}">
+                Y: <input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm kf-edit-y" style="width:70px" value="${kf.y.toFixed(2)}">
+              </div>
+              <button class="btn btn-sm btn-outline-danger btn-remove-kf" data-index="${index}">&times;</button>
+            </li>
+          `);
+
+          // 🔹 clicar no item → pular para o tempo do keyframe
+          item.on("click", function (e) {
+            if ($(e.target).is("input") || $(e.target).is("button")) return;
+
+            // 🔹 Remove destaque de todos
+            $(".keyframe-item").removeClass("active");
+
+            // 🔹 Destaca este
+            $(this).addClass("active");
+
+            // Pula para o tempo do keyframe
+            editorVideo.currentTime = kf.time;
+            timeSlider.val(kf.time.toFixed(1));
+            updateCropOverlay(kf.time);
+          });
+
+          // 🔹 listeners para edição
+          item.find(".kf-edit-time").on("change", function () {
+            currentKeyframes[index].time = parseFloat($(this).val()) || 0;
+            updateCropOverlay(currentKeyframes[index].time);
+          });
+
+          item.find(".kf-edit-x").on("change", function () {
+            currentKeyframes[index].x = Math.min(1, Math.max(0, parseFloat($(this).val()) || 0.5));
+            updateCropOverlay(currentKeyframes[index].time);
+          });
+          
+          item.find(".kf-edit-y").on("change", function () {
+            currentKeyframes[index].y = Math.min(1, Math.max(0, parseFloat($(this).val()) || 0.5));
+            updateCropOverlay(currentKeyframes[index].time);
+          });
+
+          // 🔹 remover
+          item.find(".btn-remove-kf").on("click", function () {
+            currentKeyframes.splice(index, 1);
+            updateKeyframesList();
+            updateCropOverlay();
+          });
+
+          kfList.append(item);
         });
-      kfList.append(item);
-    });
-  }
+    }
+
+
 
   btnSaveEdit.on("click", saveClipEdits);
   function saveClipEdits() {
@@ -515,7 +609,11 @@ btnYoutube.on("click", function () {
     if (proposalIndex !== -1) {
       proposals[proposalIndex].start = start;
       proposals[proposalIndex].end = end;
-      proposals[proposalIndex].keyframes = [...currentKeyframes];
+      proposals[proposalIndex].keyframes = currentKeyframes.map(kf => ({
+        t: kf.time,
+        x: kf.x,
+        y: kf.y
+      }));
 
       const item = proposalsContainer.find(`[data-clip-id="${currentEditingClip.id}"]`);
       item.find(".clip-start").val(start);

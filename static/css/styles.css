@@ -44,3 +44,20 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetic
   background: rgba(13,110,253,.4);
   border-radius: 6px;
 }
+
+#cropOverlay {
+  position: absolute;
+  border: 2px dashed red;
+  pointer-events: none;
+  transition: left 0.2s linear, top 0.2s linear, width 0.2s linear, height 0.2s linear;
+}
+
+#kfList {
+  max-height: 200px; /* ajuste a altura como preferir */
+  overflow-y: auto;
+}
+
+.keyframe-item.active {
+  background-color: #0d6efd20; /* leve azul translúcido */
+  border-left: 4px solid #0d6efd;
+}
