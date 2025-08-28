@@ -722,6 +722,66 @@ btnAddKf.on("click", () => {
     };
   }
 
+    // --------- Drag do cropOverlay ---------
+  let draggingOverlay = false;
+  let activeKeyframeIndex = null;
+
+  // quando clica num keyframe da lista → seleciona
+  kfList.on("click", ".keyframe-item", function (e) {
+    if ($(e.target).is("input") || $(e.target).is("button")) return;
+
+    $(".keyframe-item").removeClass("active");
+    $(this).addClass("active");
+    activeKeyframeIndex = $(this).index();
+
+    const kf = currentKeyframes[activeKeyframeIndex];
+    editorVideo.currentTime = kf.time;
+    timeSlider.val(kf.time.toFixed(1));
+    updateCropOverlay(kf.time);
+  });
+
+  // início do drag
+  $("#cropOverlay").on("mousedown", function (e) {
+    if (activeKeyframeIndex === null) return; // precisa ter keyframe selecionado
+    draggingOverlay = true;
+    e.preventDefault();
+  });
+
+  // movimento
+  $(document).on("mousemove", function (e) {
+    if (!draggingOverlay || activeKeyframeIndex === null) return;
+
+    const rect = $("#editorVideo").offset();
+    const videoW = editorVideo.clientWidth;
+    const videoH = editorVideo.clientHeight;
+
+    // posição do mouse relativa ao vídeo
+    let relX = (e.pageX - rect.left) / videoW;
+    let relY = (e.pageY - rect.top) / videoH;
+
+    // clampa entre 0 e 1
+    relX = Math.min(1, Math.max(0, relX));
+    relY = Math.min(1, Math.max(0, relY));
+
+    // atualiza keyframe ativo
+    currentKeyframes[activeKeyframeIndex].x = relX;
+    currentKeyframes[activeKeyframeIndex].y = relY;
+
+    // atualiza overlay e inputs
+    updateCropOverlay(editorVideo.currentTime);
+    updateKeyframesList();
+
+    // mantém item selecionado com highlight
+    kfList.find(".keyframe-item").removeClass("active")
+      .eq(activeKeyframeIndex).addClass("active");
+  });
+
+  // fim do drag
+  $(document).on("mouseup", function () {
+    draggingOverlay = false;
+  });
+
+
   btnZip.on("click", function () {
     if (currentSessionId) {
       window.location.href = `/download/${currentSessionId}`;

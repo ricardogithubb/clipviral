@@ -48,7 +48,7 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetic
 #cropOverlay {
   position: absolute;
   border: 2px dashed red;
-  background-color: rgba(0, 0, 0, 1);
+  background-color: rgba(29, 23, 214, 0.5);
   pointer-events: none;
   transition: left 0.2s linear, top 0.2s linear, width 0.2s linear, height 0.2s linear;
 }

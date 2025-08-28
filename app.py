@@ -21,6 +21,8 @@ from werkzeug.utils import secure_filename
 import cv2
 import numpy as np
 
+import mediapipe as mp
+
 # ------------------ CONFIG ------------------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -251,6 +253,88 @@ def analyze_video_fast_simple(video_path: str, update_cb=None) -> List[Dict[str,
         if update_cb:
             pct = (i / total_frames) * 80
             update_cb(pct, f"Processando vídeo... {pct:.1f}%")
+
+    cap.release()
+
+    # normaliza sinais
+    faces_arr = np.array(face_scores, dtype=np.float32)
+    face_t = np.array(face_times, dtype=np.float32)
+    faces_interp = np.interp(rms_t, face_t, faces_arr) if len(faces_arr) > 1 else np.zeros_like(rms_t)
+    faces_norm = faces_interp / faces_interp.max() if faces_interp.max() > 0 else faces_interp
+    score = 0.7 * rms_norm + 0.3 * faces_norm
+
+    return _generate_clip_proposals(duration, rms_t, score, all_keyframes)
+
+
+def analyze_video_fast_mediapipe(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
+    meta = ffprobe_json(video_path)
+    duration = float(meta["format"]["duration"])
+    all_keyframes = []
+
+    if duration <= 0:
+        return []
+
+    wav_tmp = os.path.join(TMP_FOLDER, f"{uuid.uuid4().hex}.wav")
+    try:
+        downmix_audio_pcm16(video_path, wav_tmp, sr=22050)
+        samples = read_wav_as_np_int16(wav_tmp)
+    finally:
+        try: os.remove(wav_tmp)
+        except Exception: pass
+
+    sr = 22050
+    win = max(1, int(0.2 * sr))
+    rms = moving_rms(samples, win)
+    rms_t = np.arange(len(rms)) * (1.0 / sr) + (win / (2 * sr))
+    rms_norm = rms / rms.max() if rms.max() > 0 else rms
+
+    mp_face_mesh = mp.solutions.face_mesh
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (duration * fps))
+    frame_interval = int(fps)
+    face_times, face_scores = [], []
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=2,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5) as face_mesh:
+
+        for i in range(0, total_frames, max(1, frame_interval)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ok, frame = cap.read()
+            if not ok: continue
+
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb)
+            timestamp = i / fps
+            score_face = 0
+
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    # pontos dos lábios (mediapipe usa índices da boca)
+                    top_lip = face_landmarks.landmark[13]  # lábio superior
+                    bottom_lip = face_landmarks.landmark[14]  # lábio inferior
+                    mouth_open = abs(bottom_lip.y - top_lip.y)
+
+                    # normalizar em pixels
+                    mouth_score = mouth_open * h * 2  
+
+                    cx = face_landmarks.landmark[0].x
+                    cy = face_landmarks.landmark[0].y
+
+                    score_face = min(5, 1 + mouth_score/10.0)
+                    all_keyframes.append({"t": timestamp, "x": cx, "y": cy})
+
+            face_times.append(timestamp)
+            face_scores.append(score_face)
+
+            if update_cb:
+                pct = (i / total_frames) * 80
+                update_cb(pct, f"Processando vídeo... {pct:.1f}%")
 
     cap.release()
 
@@ -570,7 +654,7 @@ def analyze():
                     progress_store[session_id]["total"] = round(pct, 2)
                     progress_store[session_id]["message"] = msg
 
-            proposals = analyze_video_fast_simple(filepath, update_cb=on_update)
+            proposals = analyze_video_fast_mediapipe(filepath, update_cb=on_update)
 
             with progress_lock:
                 progress_store[session_id]["status"] = "done"
