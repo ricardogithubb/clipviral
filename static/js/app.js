@@ -514,7 +514,6 @@ btnAddKf.on("click", () => {
     editorVideo.addEventListener("timeupdate", stopPlayback);
   });
 
-  btnAddKf.on("click", addKeyframe);
   function addKeyframe() {
     const x = parseFloat(kfX.val());
     const y = parseFloat(kfY.val());

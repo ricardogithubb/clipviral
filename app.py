@@ -186,10 +186,10 @@ def remove_metadata(input_path: str, output_path: str) -> bool:
         return False
 
 
-def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
+def analyze_video_fast_simple(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
     meta = ffprobe_json(video_path)
     duration = float(meta["format"]["duration"])
-    all_keyframes = []  # keyframes globais coletados
+    all_keyframes = []
 
     if duration <= 0:
         return []
@@ -199,110 +199,96 @@ def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
         downmix_audio_pcm16(video_path, wav_tmp, sr=22050)
         samples = read_wav_as_np_int16(wav_tmp)
     finally:
-        try:
-            os.remove(wav_tmp)
-        except Exception:
-            pass
+        try: os.remove(wav_tmp)
+        except Exception: pass
 
     sr = 22050
     win = max(1, int(0.2 * sr))
     rms = moving_rms(samples, win)
-    if rms.size == 0:
-        rms = np.zeros(1, dtype=np.float32)
     rms_t = np.arange(len(rms)) * (1.0 / sr) + (win / (2 * sr))
-
-    if rms.max() > 0:
-        rms_norm = rms / rms.max()
-    else:
-        rms_norm = rms
+    rms_norm = rms / rms.max() if rms.max() > 0 else rms
 
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (duration * fps))
     frame_interval = int(fps)
-    face_times = []
-    face_scores = []
+    face_times, face_scores = [], []
 
     for i in range(0, total_frames, max(1, frame_interval)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ok, frame = cap.read()
-        if not ok:
-            continue
+        if not ok: continue
+
         h, w = frame.shape[:2]
         new_w = 320
         new_h = int(h * (new_w / w))
         small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
         faces = face_cascade.detectMultiScale(gray, 1.1, 4)
         timestamp = i / fps
-        face_times.append(timestamp)
-        face_scores.append(min(5, len(faces)))
+        score_face = 0
+
         if len(faces) > 0:
-            # pega a face mais central (ou maior)
+            # pega a maior face
             (fx, fy, fw, fh) = max(faces, key=lambda f: f[2]*f[3])
             cx = (fx + fw/2) / new_w
             cy = (fy + fh/2) / new_h
-            # normaliza Y (topo=0, base=1)
-            cy = cy  
+
+            # pega região da boca (parte inferior do rosto)
+            mouth_region = gray[int(fy+fh*0.6):fy+fh, fx:fx+fw]
+            mouth_activity = mouth_region.var() if mouth_region.size > 0 else 0
+
+            # score = nº de faces + movimento da boca
+            score_face = min(5, len(faces) + mouth_activity/5000.0)
+
             all_keyframes.append({"t": timestamp, "x": cx, "y": cy})
 
+        face_times.append(timestamp)
+        face_scores.append(score_face)
 
-        # 🔥 Atualiza progresso baseado nos frames
         if update_cb:
-            pct = (i / total_frames) * 80  # até 80% do progresso
+            pct = (i / total_frames) * 80
             update_cb(pct, f"Processando vídeo... {pct:.1f}%")
 
     cap.release()
+
+    # normaliza sinais
     faces_arr = np.array(face_scores, dtype=np.float32)
     face_t = np.array(face_times, dtype=np.float32)
-
-    if len(faces_arr) > 1:
-        faces_interp = np.interp(rms_t, face_t, faces_arr)
-    else:
-        faces_interp = np.zeros_like(rms_t)
-
-    if faces_interp.max() > 0:
-        faces_norm = faces_interp / faces_interp.max()
-    else:
-        faces_norm = faces_interp
-
+    faces_interp = np.interp(rms_t, face_t, faces_arr) if len(faces_arr) > 1 else np.zeros_like(rms_t)
+    faces_norm = faces_interp / faces_interp.max() if faces_interp.max() > 0 else faces_interp
     score = 0.7 * rms_norm + 0.3 * faces_norm
 
+    return _generate_clip_proposals(duration, rms_t, score, all_keyframes)
+
+
+def _generate_clip_proposals(duration, rms_t, score, all_keyframes):
     clip_len = 60.0
     max_clips = max(1, min(3, int(duration // 15)))
     peaks_idx = score.argsort()[::-1]
 
-    used_intervals = []
-    proposals = []
+    used_intervals, proposals = [], []
 
-    def overlaps(a, b):
-        return not (a[1] <= b[0] or b[1] <= a[0])
+    def overlaps(a, b): return not (a[1] <= b[0] or b[1] <= a[0])
 
     for idx in peaks_idx:
         t = float(rms_t[idx])
         start = clamp(t - clip_len / 2, 0.0, max(0.0, duration - clip_len))
         end = min(start + clip_len, duration)
         candidate = (start, end)
-        if any(overlaps(candidate, u) for u in used_intervals):
-            continue
+        if any(overlaps(candidate, u) for u in used_intervals): continue
 
-        proposals.append(
-            {
-                "id": str(uuid.uuid4()),
-                "start": float(start),
-                "end": float(end),
-                "score": float(score[idx]),
-                "keyframes": [
-                    kf for kf in all_keyframes
-                    if start <= kf["t"] <= end
-                ]
-            }
-        )
-
+        proposals.append({
+            "id": str(uuid.uuid4()),
+            "start": float(start),
+            "end": float(end),
+            "score": float(score[idx]),
+            "keyframes": [kf for kf in all_keyframes if start <= kf["t"] <= end]
+        })
         used_intervals.append(candidate)
-        if len(proposals) >= max_clips:
-            break
+        if len(proposals) >= max_clips: break
 
     if not proposals:
         n = int(math.ceil(duration / clip_len))
@@ -312,6 +298,7 @@ def analyze_video_fast(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
             proposals.append({"id": str(uuid.uuid4()), "start": float(s), "end": float(e), "score": 0.0})
 
     return proposals
+
 
 
 def build_crop_filter_916_with_keyframes(start: float, end: float, keyframes: List[Dict[str, float]]) -> str:
@@ -583,7 +570,7 @@ def analyze():
                     progress_store[session_id]["total"] = round(pct, 2)
                     progress_store[session_id]["message"] = msg
 
-            proposals = analyze_video_fast(filepath, update_cb=on_update)
+            proposals = analyze_video_fast_simple(filepath, update_cb=on_update)
 
             with progress_lock:
                 progress_store[session_id]["status"] = "done"
