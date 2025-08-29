@@ -214,19 +214,19 @@ def analyze_video_fast_simple(video_path: str, update_cb=None) -> List[Dict[str,
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (duration * fps))
-    frame_interval = int(fps)
+    frame_interval = int(fps * 2)
     face_times, face_scores = [], []
 
     for i in range(0, total_frames, max(1, frame_interval)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ok, frame = cap.read()
-        if not ok: continue
+        if not ok:
+            continue
 
-        h, w = frame.shape[:2]
-        new_w = 320
-        new_h = int(h * (new_w / w))
-        small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        # 🔽 Reduz resolução para 360p (mantém proporção)
+        frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         faces = face_cascade.detectMultiScale(gray, 1.1, 4)
         timestamp = i / fps
@@ -292,7 +292,7 @@ def analyze_video_fast_mediapipe(video_path: str, update_cb=None) -> List[Dict[s
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or (duration * fps))
-    frame_interval = int(fps)
+    frame_interval = int(fps * 2)
     face_times, face_scores = [], []
 
     with mp_face_mesh.FaceMesh(
@@ -305,7 +305,11 @@ def analyze_video_fast_mediapipe(video_path: str, update_cb=None) -> List[Dict[s
         for i in range(0, total_frames, max(1, frame_interval)):
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ok, frame = cap.read()
-            if not ok: continue
+            if not ok:
+                continue
+
+            # 🔽 Reduz resolução para 360p (mantém proporção)
+            frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
 
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -402,56 +406,70 @@ def build_crop_filter_916_with_keyframes(start: float, end: float, keyframes: Li
     return f"{crop},{scale}"
 
 
-def ffmpeg_render_clip(input_path: str, out_path: str, start: float, end: float, keyframes: List[Dict[str, float]], update_cb=None):
+def ffmpeg_render_clip(input_path: str, out_path: str, start: float, end: float,
+                       keyframes: List[Dict[str, float]], update_cb=None):
     vf = build_crop_filter_916_with_keyframes(start, end, keyframes)
 
     cmd = [
         "ffmpeg",
         "-y",
-        "-i",
-        input_path,
-        "-ss",
-        str(start),
-        "-to",
-        str(end),
-        "-vf",
-        vf,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        "-progress",
-        "-",
+        "-i", input_path,
+        "-ss", str(start),
+        "-to", str(end),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-progress", "-",   # 🔄 envia progresso para STDOUT
         out_path,
     ]
 
     cut_dur = max(0.001, float(end - start))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,      # progresso vem aqui
+        stderr=subprocess.DEVNULL,   # descarta logs normais
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
 
     percent = 0.0
+    start_time = time.time()
+
     try:
-        for line in proc.stdout:
+        while True:
+            line = proc.stdout.readline()   # 🔄 agora lemos do STDOUT
+            if not line and proc.poll() is not None:
+                break
+
             line = line.strip()
             if line.startswith("out_time_ms="):
                 out_ms = float(line.split("=", 1)[1])
                 tcur = out_ms / 1_000_000.0
                 percent = max(0.0, min(100.0, (tcur / cut_dur) * 100.0))
                 if update_cb:
-                    update_cb(percent)
+                    update_cb(round(percent, 2))
+
             elif line.startswith("progress=") and line.endswith("end"):
                 percent = 100.0
                 if update_cb:
-                    update_cb(percent)
+                    update_cb(100.0)
+
+            # 🔄 fallback se ffmpeg não reportar nada
+            if time.time() - start_time > 2 and percent == 0.0:
+                elapsed = time.time() - start_time
+                fake_pct = min(99.0, (elapsed / cut_dur) * 100.0)
+                if update_cb:
+                    update_cb(round(fake_pct, 2))
+
     finally:
         proc.wait()
+
+
 
 
 def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):

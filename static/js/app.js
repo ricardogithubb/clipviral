@@ -672,114 +672,61 @@ btnAddKf.on("click", () => {
   }
 
   function listenRenderProgress(sessionId) {
-    const evt = new EventSource(`/render_status/${sessionId}`);
-    evt.onmessage = function (event) {
-      try {
-        const data = JSON.parse(event.data);
-        const total = Number(data.total || 0);
-        const status = data.status || "running";
-        const message = data.message || "";
+  const evt = new EventSource(`/render_status/${sessionId}`);
+  evt.onmessage = function (event) {
+    try {
+      const data = JSON.parse(event.data);
+      const total = Number(data.total || 0);
+      const status = data.status || "running";
+      const message = data.message || "";
 
-        renderProgress.css("width", `${total}%`);
-        renderProgress.text(`${total}%`);
-        renderMsg.text(message);
+      // 🔹 Barra de progresso geral
+      renderProgress.css("width", `${total}%`);
+      renderProgress.text(`${total.toFixed(1)}%`);
+      renderMsg.text(message);
 
-        if (data.clips) {
-          Object.entries(data.clips).forEach(([clipId, info]) => {
-            const pct = info.percent ?? 0;
-            const badge = $(`[data-clip-badge="${clipId}"]`);
-            if (badge.length) badge.text(`${pct}%`);
-          });
-        }
-
-        if (status === "done") {
-          evt.close();
-          renderMsg.html('<span class="text-success">Renderização concluída!</span>');
-          btnZip.prop("disabled", false);
-
-          proposalsContainer.find(".list-group-item").each(function () {
-            const clipId = $(this).data("clip-id");
-            if ($(this).find(".btn-outline-success").length === 0) {
-              const clipUrl = `/download_clip/${sessionId}/${clipId}`;
-              $(this)
-                .find(".d-flex")
-                .append(`<a href="${clipUrl}" class="btn btn-sm btn-outline-success">Download</a>`);
-              $(this).append(`
-                <div class="mt-2">
-                  <video src="${clipUrl}" controls preload="metadata" style="max-width:100%; height:auto;"></video>
-                </div>
-              `);
-            }
-          });
-        } else if (status === "error") {
-          evt.close();
-          renderMsg.html(`<span class="text-danger">${message}</span>`);
-          btnRender.prop("disabled", false);
-        }
-      } catch (e) {
-        console.error("SSE parse error:", e);
+      // 🔹 Progresso individual dos cortes
+      if (data.clips) {
+        Object.entries(data.clips).forEach(([clipId, info]) => {
+          const pct = info.percent ?? 0;
+          const badge = $(`[data-clip-badge="${clipId}"]`);
+          if (badge.length) {
+            badge.text(`${pct.toFixed(1)}%`);
+          }
+        });
       }
-    };
-  }
 
-    // --------- Drag do cropOverlay ---------
-  let draggingOverlay = false;
-  let activeKeyframeIndex = null;
+      if (status === "done") {
+        evt.close();
+        renderMsg.html('<span class="text-success">Renderização concluída!</span>');
+        btnZip.prop("disabled", false);
 
-  // quando clica num keyframe da lista → seleciona
-  kfList.on("click", ".keyframe-item", function (e) {
-    if ($(e.target).is("input") || $(e.target).is("button")) return;
+        // Adiciona botão e preview para cada corte
+        proposalsContainer.find(".list-group-item").each(function () {
+          const clipId = $(this).data("clip-id");
+          if ($(this).find(".btn-outline-success").length === 0) {
+            const clipUrl = `/download_clip/${sessionId}/${clipId}`;
+            $(this)
+              .find(".d-flex")
+              .append(`<a href="${clipUrl}" class="btn btn-sm btn-outline-success">Download</a>`);
+            $(this).append(`
+              <div class="mt-2">
+                <video src="${clipUrl}" controls preload="metadata" style="max-width:100%; height:auto;"></video>
+              </div>
+            `);
+          }
+        });
+      } else if (status === "error") {
+        evt.close();
+        renderMsg.html(`<span class="text-danger">${message}</span>`);
+        btnRender.prop("disabled", false);
+      }
+    } catch (e) {
+      console.error("SSE parse error:", e);
+    }
+  };
+}
 
-    $(".keyframe-item").removeClass("active");
-    $(this).addClass("active");
-    activeKeyframeIndex = $(this).index();
-
-    const kf = currentKeyframes[activeKeyframeIndex];
-    editorVideo.currentTime = kf.time;
-    timeSlider.val(kf.time.toFixed(1));
-    updateCropOverlay(kf.time);
-  });
-
-  // início do drag
-  $("#cropOverlay").on("mousedown", function (e) {
-    if (activeKeyframeIndex === null) return; // precisa ter keyframe selecionado
-    draggingOverlay = true;
-    e.preventDefault();
-  });
-
-  // movimento
-  $(document).on("mousemove", function (e) {
-    if (!draggingOverlay || activeKeyframeIndex === null) return;
-
-    const rect = $("#editorVideo").offset();
-    const videoW = editorVideo.clientWidth;
-    const videoH = editorVideo.clientHeight;
-
-    // posição do mouse relativa ao vídeo
-    let relX = (e.pageX - rect.left) / videoW;
-    let relY = (e.pageY - rect.top) / videoH;
-
-    // clampa entre 0 e 1
-    relX = Math.min(1, Math.max(0, relX));
-    relY = Math.min(1, Math.max(0, relY));
-
-    // atualiza keyframe ativo
-    currentKeyframes[activeKeyframeIndex].x = relX;
-    currentKeyframes[activeKeyframeIndex].y = relY;
-
-    // atualiza overlay e inputs
-    updateCropOverlay(editorVideo.currentTime);
-    updateKeyframesList();
-
-    // mantém item selecionado com highlight
-    kfList.find(".keyframe-item").removeClass("active")
-      .eq(activeKeyframeIndex).addClass("active");
-  });
-
-  // fim do drag
-  $(document).on("mouseup", function () {
-    draggingOverlay = false;
-  });
 
 
   btnZip.on("click", function () {
