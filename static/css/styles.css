@@ -62,3 +62,47 @@ body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetic
   background-color: #0d6efd20; /* leve azul translúcido */
   border-left: 4px solid #0d6efd;
 }
+
+/* Estilos para o círculo de progresso */
+.progress-circle-container {
+  position: relative;
+  width: 120px;
+  height: 120px;
+}
+
+.progress-circle-bg {
+  fill: none;
+  stroke: #2d3748;
+  stroke-linecap: round;
+}
+
+.progress-circle-fill {
+  fill: none;
+  stroke: #0d6efd;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+  transition: stroke-dashoffset 0.3s ease;
+}
+
+.progress-percentage {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: white;
+}
+
+/* Modal transparente */
+.modal-content.bg-transparent {
+  background-color: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Bloqueio de interação */
+.modal-backdrop {
+  background-color: rgba(0, 0, 0, 0.8);
+}
