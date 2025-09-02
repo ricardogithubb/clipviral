@@ -1,5 +1,6 @@
 import os
 import io
+import random
 import re
 import gc
 import uuid
@@ -17,6 +18,8 @@ import yt_dlp
 
 from flask import Flask, render_template, request, jsonify, send_from_directory, Response
 from werkzeug.utils import secure_filename
+
+from flask_socketio import SocketIO
 
 import cv2
 import numpy as np
@@ -37,6 +40,14 @@ os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 os.makedirs(TMP_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    logger=True,          # <-- loga os eventos Socket.IO
+    engineio_logger=True, # <-- loga o tráfego Engine.IO (conexões/ws)
+    async_mode="threading"
+)
+
 app.config.update(
     UPLOAD_FOLDER=UPLOAD_FOLDER,
     PROCESSED_FOLDER=PROCESSED_FOLDER,
@@ -266,7 +277,10 @@ def analyze_video_fast_simple(video_path: str, update_cb=None) -> List[Dict[str,
     return _generate_clip_proposals(duration, rms_t, score, all_keyframes)
 
 
-def analyze_video_fast_mediapipe(video_path: str, update_cb=None) -> List[Dict[str, Any]]:
+def analyze_video_fast_mediapipe(video_path: str, update_cb=None,
+                                 clip_length: float = 60.0,
+                                 max_clips: int = 3) -> List[Dict[str, Any]]:
+
     meta = ffprobe_json(video_path)
     duration = float(meta["format"]["duration"])
     all_keyframes = []
@@ -349,12 +363,13 @@ def analyze_video_fast_mediapipe(video_path: str, update_cb=None) -> List[Dict[s
     faces_norm = faces_interp / faces_interp.max() if faces_interp.max() > 0 else faces_interp
     score = 0.7 * rms_norm + 0.3 * faces_norm
 
-    return _generate_clip_proposals(duration, rms_t, score, all_keyframes)
+    return _generate_clip_proposals(duration, rms_t, score, all_keyframes,
+                                clip_len=clip_length,
+                                max_clips=max_clips)
 
 
-def _generate_clip_proposals(duration, rms_t, score, all_keyframes):
-    clip_len = 60.0
-    max_clips = max(1, min(3, int(duration // 15)))
+def _generate_clip_proposals(duration, rms_t, score, all_keyframes,
+                             clip_len=60.0, max_clips=3):
     peaks_idx = score.argsort()[::-1]
 
     used_intervals, proposals = [], []
@@ -501,6 +516,16 @@ def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):
                     progress_store[session_id]["total"] = round(sum(percs) / max(1, len(percs)), 2)
                     progress_store[session_id]["message"] = f"Renderizando {idx}/{len(clips)}..."
 
+                    # 🔹 Envia update em tempo real via WebSocket
+                    socketio.emit("render_progress", {
+                        "session_id": session_id,
+                        "clips": progress_store[session_id]["clips"],
+                        "total": progress_store[session_id]["total"],
+                        "status": "running",
+                        "message": progress_store[session_id]["message"],
+                    })
+
+
             ffmpeg_render_clip(filepath, out_path_tmp, start, end, keyframes, on_progress)
 
             if not remove_metadata(out_path_tmp, out_path):
@@ -514,17 +539,18 @@ def render_session(session_id: str, filepath: str, clips: List[Dict[str, Any]]):
             with progress_lock:
                 progress_store[session_id]["clips"][clip_id]["filename"] = f"{clip_id}.mp4"
 
-        zip_path = os.path.join(PROCESSED_FOLDER, f"{session_id}.zip")
-        import zipfile
-
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-            for clip in clips:
-                fname = f"{clip['id']}.mp4"
-                zipf.write(os.path.join(out_dir, fname), fname)
-
         with progress_lock:
             progress_store[session_id]["status"] = "done"
             progress_store[session_id]["message"] = "Renderização concluída."
+
+        socketio.emit("render_progress", {
+            "session_id": session_id,
+            "clips": progress_store[session_id]["clips"],
+            "total": 100.0,
+            "status": "done",
+            "message": "Renderização concluída."
+        })
+
 
     except Exception as e:
         with progress_lock:
@@ -543,7 +569,7 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload_file():
-    clear_uploads()
+    # clear_uploads()
     if "file" not in request.files:
         return jsonify({"error": "No file part"}), 400
     f = request.files["file"]
@@ -562,7 +588,7 @@ def upload_file():
 
 @app.route("/upload_youtube", methods=["POST"])
 def upload_youtube():
-    clear_uploads()
+    # clear_uploads()
     data = request.get_json(silent=True) or {}
     url = data.get("url")
     if not url:
@@ -586,7 +612,7 @@ def upload_youtube():
                         percent = d.get("_percent_str", "0%")
                         progress_store[session_id]["status"] = "running"
                         progress_store[session_id]["message"] = f"Baixando... {percent}"
-                        progress_store[session_id]["total"] = float(d.get("_percent", 0.0)) * 100
+                        progress_store[session_id]["total"] = float(d.get("_percent", 0.0))
                     elif d["status"] == "finished":
                         # 🔧 Corrigido: garantir que aponta para o arquivo final .mp4
                         vid_id = d.get("info_dict", {}).get("id")
@@ -596,10 +622,12 @@ def upload_youtube():
                         progress_store[session_id]["filename"] = os.path.basename(final_path)
                         progress_store[session_id]["filepath"] = final_path
 
+            #valor aleatorio para adicionar ao nome do arquivo
+            random_number = random.randint(1, 1000)
+
             ydl_opts = {
-                "outtmpl": os.path.join(UPLOAD_FOLDER, "%(id)s.%(ext)s"),
-                # 🔧 Forçar H.264 (avc1) em MP4, evita AV1
-                "format": "bestvideo+bestaudio/best",
+                "outtmpl": os.path.join(UPLOAD_FOLDER, f"{random_number}%(id)s.%(ext)s"),
+                "format": "bv*[vcodec^=avc1]+ba/best",
                 "merge_output_format": "mp4",
                 "retries": 10,
                 "fragment_retries": 10,
@@ -608,9 +636,9 @@ def upload_youtube():
                 "no_color": True,
                 "prefer_ffmpeg": True,
                 "ffmpeg_location": "/usr/bin/ffmpeg",
-                # 🔑 Arquivo de cookies exportado do navegador
                 # "cookiefile": "/home/ubuntu/cookies.txt",
             }
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except Exception as e:
@@ -653,6 +681,10 @@ def youtube_status(session_id: str):
 def analyze():
     data = request.get_json(silent=True) or {}
     filepath = data.get("filepath")
+
+    clip_length = float(data.get("clip_length", 60.0))
+    max_clips = int(data.get("max_clips", 3))
+
     if not filepath or not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 404
 
@@ -672,7 +704,9 @@ def analyze():
                     progress_store[session_id]["total"] = round(pct, 2)
                     progress_store[session_id]["message"] = msg
 
-            proposals = analyze_video_fast_mediapipe(filepath, update_cb=on_update)
+            proposals = analyze_video_fast_mediapipe(filepath, update_cb=on_update,
+                                                    clip_length=clip_length,
+                                                    max_clips=max_clips)
 
             with progress_lock:
                 progress_store[session_id]["status"] = "done"
@@ -728,9 +762,7 @@ def render():
     with progress_lock:
         progress_store[session_id] = {"status": "idle", "message": "Aguardando...", "clips": {}, "total": 0.0}
 
-    t = threading.Thread(target=render_session, args=(session_id, filepath, clips), daemon=True)
-    t.start()
-
+    socketio.start_background_task(render_session, session_id, filepath, clips)
     return jsonify({"session_id": session_id})
 
 
@@ -753,8 +785,8 @@ def render_single():
     with progress_lock:
         progress_store[session_id] = {"status": "idle", "message": "Aguardando...", "clips": {}, "total": 0.0}
 
-    t = threading.Thread(target=render_session, args=(session_id, filepath, [clip]), daemon=True)
-    t.start()
+    socketio.start_background_task(render_session, session_id, filepath, clips)
+
 
     return jsonify({"session_id": session_id, "clip_id": clip.get("id")})
 
@@ -776,14 +808,6 @@ def render_status(session_id: str):
             time.sleep(0.5)
 
     return Response(stream(), mimetype="text/event-stream")
-
-
-@app.route("/download/<session_id>")
-def download_zip(session_id: str):
-    zip_path = os.path.join(PROCESSED_FOLDER, f"{session_id}.zip")
-    if os.path.exists(zip_path):
-        return send_from_directory(PROCESSED_FOLDER, f"{session_id}.zip", as_attachment=True)
-    return jsonify({"error": "File not found"}), 404
 
 
 @app.route("/download_clip/<session_id>/<clip_id>")
@@ -828,9 +852,9 @@ def clear_uploads():
 def cleanup_worker():
     while True:
         try:
-            clean_older_than(UPLOAD_FOLDER, hours=12)
-            clean_older_than(PROCESSED_FOLDER, hours=24)
-            clean_older_than(TMP_FOLDER, hours=6)
+            clean_older_than(UPLOAD_FOLDER, hours=0.5)
+            clean_older_than(PROCESSED_FOLDER, hours=0.5)
+            clean_older_than(TMP_FOLDER, hours=0.5)
         except Exception:
             pass
         time.sleep(3600)
@@ -840,4 +864,5 @@ threading.Thread(target=cleanup_worker, daemon=True).start()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=True)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+
