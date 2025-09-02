@@ -1,9 +1,33 @@
 $(document).ready(function () {
+
+  // --------- WebSocket ---------
+  const socket = io();
+  socket.on("connect", () => {
+    console.log("✅ Conectado ao WebSocket");
+  });
+
+  socket.on("disconnect", () => {
+    console.warn("⚠️ WebSocket desconectado");
+  });
+
+  // 🔹 Log genérico para qualquer evento que chegue
+  // socket.onAny((event, data) => {
+  //   console.log("📩 Evento recebido:", event, data);
+  // });
+
   // --------- Estado ---------
   let currentFile = null;
   let uploadedFilePath = null;
   let proposals = [];
   let currentSessionId = null;
+
+  // --------- Modal de Progresso ---------
+  const progressModal = new bootstrap.Modal("#progressModal");
+  const circle = $("#circleProgress");
+  const progressTitle = $("#progressTitle");
+  const progressMessage = $("#progressMessage");
+  const circleFill = $(".progress-circle-fill");
+
 
   // --------- Elementos ---------
   const dropzone = $("#dropzone");
@@ -11,7 +35,6 @@ $(document).ready(function () {
   const btnSelect = $("#btnSelect");
   const btnAnalyze = $("#btnAnalyze");
   const btnRender = $("#btnRender");
-  const btnZip = $("#btnZip");
   const uploadInfo = $("#uploadInfo");
   const progUpload = $("#progUpload");
   const proposalsContainer = $("#proposals");
@@ -86,8 +109,10 @@ btnYoutube.on("click", function () {
   uploadInfo.text("Iniciando download do YouTube...");
   btnAnalyze.prop("disabled", true);
   btnRender.prop("disabled", true);
-  btnZip.prop("disabled", true);
   proposalsContainer.empty();
+
+  updateProgress(0, "Baixando vídeo do YouTube", "Conectando...");
+  progressModal.show();
 
   $.ajax({
     url: "/upload_youtube",
@@ -101,6 +126,8 @@ btnYoutube.on("click", function () {
       evtSource.onmessage = function (event) {
         const data = JSON.parse(event.data);
         uploadInfo.text(data.message);
+        updateProgress(data.total || 0, "Baixando vídeo do YouTube", data.message || "");
+
 
         if (data.status === "done") {
           // 🔧 corrigido: usar o caminho completo em vez de só o nome
@@ -110,11 +137,15 @@ btnYoutube.on("click", function () {
 
           btnAnalyze.prop("disabled", false);
           evtSource.close();
+          progressModal.hide();
+
         }
 
         if (data.status === "error") {
           alert("Erro ao baixar: " + data.message);
           evtSource.close();
+          progressModal.hide();
+
         }
       };
     },
@@ -123,6 +154,16 @@ btnYoutube.on("click", function () {
     }
   });
 });
+
+function updateProgress(percent, title, message) {
+  const totalLength = 339.292; // mesmo valor do stroke-dasharray no SVG
+  const offset = totalLength - (percent / 100) * totalLength;
+  circleFill.css("stroke-dashoffset", offset);
+  circle.text(`${percent.toFixed(0)}%`);
+  if (title) progressTitle.text(title);
+  if (message) progressMessage.text(message);
+}
+
 
 
 
@@ -186,7 +227,6 @@ btnAddKf.on("click", () => {
     uploadInfo.text(`${file.name} (${formatFileSize(file.size)})`);
     btnAnalyze.prop("disabled", true);
     btnRender.prop("disabled", true);
-    btnZip.prop("disabled", true);
     proposalsContainer.empty();
     uploadedFilePath = null;
 
@@ -250,6 +290,9 @@ btnAddKf.on("click", () => {
       return;
     }
 
+    const clipLength = parseInt($("#clipLength").val(), 10) || 60;
+    const maxClips = parseInt($("#maxClips").val(), 10) || 3;
+
     console.log("Analisando:", uploadedFilePath);
 
     btnAnalyze.prop("disabled", true);
@@ -257,11 +300,18 @@ btnAddKf.on("click", () => {
       '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Analisando...'
     );
 
+    updateProgress(0, "Analisando vídeo", "Iniciando análise...");
+    progressModal.show();
+
     $.ajax({
       url: "/analyze",
       type: "POST",
       contentType: "application/json",
-      data: JSON.stringify({ filepath: uploadedFilePath }),
+      data: JSON.stringify({ 
+        filepath: uploadedFilePath,
+        clip_length: clipLength,
+        max_clips: maxClips
+      }),
       success: function (response) {
         const sessionId = response.session_id;
         const evtSource = new EventSource(`/analyze_status/${sessionId}`);
@@ -272,6 +322,9 @@ btnAddKf.on("click", () => {
 
           // Atualiza mensagem
           uploadInfo.text(data.message || "");
+
+          updateProgress(data.total, "Analisando vídeo", data.message || "");
+
 
           // Atualiza progresso (se quiser usar barra de renderização existente)
           if (data.total !== undefined) {
@@ -286,14 +339,15 @@ btnAddKf.on("click", () => {
             displayProposals();
             btnAnalyze.prop("disabled", false).text("Gerar cortes");
             btnRender.prop("disabled", proposals.length === 0);
-            btnZip.prop("disabled", true);
             evtSource.close();
+            progressModal.hide();
           }
 
           if (data.status === "error") {
             alert("Erro na análise: " + data.message);
             btnAnalyze.prop("disabled", false).text("Gerar cortes");
             evtSource.close();
+            progressModal.hide();
           }
         };
       },
@@ -641,6 +695,10 @@ btnAddKf.on("click", () => {
     renderProgress.text("");
     renderMsg.text("Preparando para renderizar...");
 
+    updateProgress(0, "Renderizando cortes", "Preparando...");
+    progressModal.show();
+
+
     $.ajax({
       url: "/render",
       type: "POST",
@@ -672,20 +730,29 @@ btnAddKf.on("click", () => {
   }
 
   function listenRenderProgress(sessionId) {
-  const evt = new EventSource(`/render_status/${sessionId}`);
-  evt.onmessage = function (event) {
-    try {
-      const data = JSON.parse(event.data);
+    // Evita handlers duplicados quando render é clicado mais de uma vez
+    socket.off("render_progress");
+
+    // (Opcional) logar qual sessão estamos ouvindo
+    console.log("[listenRenderProgress] ouvindo session_id:", sessionId);
+
+    socket.on("render_progress", (data) => {
+      // Se você continuar emitindo "para todos" no servidor, mantenha o filtro por sessão:
+      if (data.session_id !== sessionId) return;
+
       const total = Number(data.total || 0);
       const status = data.status || "running";
       const message = data.message || "";
 
-      // 🔹 Barra de progresso geral
+      // Barra de progresso (linha)
       renderProgress.css("width", `${total}%`);
       renderProgress.text(`${total.toFixed(1)}%`);
       renderMsg.text(message);
 
-      // 🔹 Progresso individual dos cortes
+      // Círculo do modal (SVG)
+      updateProgress(total, "Renderizando cortes", message);
+
+      // Progresso individual por corte
       if (data.clips) {
         Object.entries(data.clips).forEach(([clipId, info]) => {
           const pct = info.percent ?? 0;
@@ -697,11 +764,10 @@ btnAddKf.on("click", () => {
       }
 
       if (status === "done") {
-        evt.close();
+        progressModal.hide();
         renderMsg.html('<span class="text-success">Renderização concluída!</span>');
-        btnZip.prop("disabled", false);
 
-        // Adiciona botão e preview para cada corte
+        // Links de download + preview do vídeo
         proposalsContainer.find(".list-group-item").each(function () {
           const clipId = $(this).data("clip-id");
           if ($(this).find(".btn-outline-success").length === 0) {
@@ -717,21 +783,12 @@ btnAddKf.on("click", () => {
           }
         });
       } else if (status === "error") {
-        evt.close();
+        progressModal.hide();
         renderMsg.html(`<span class="text-danger">${message}</span>`);
         btnRender.prop("disabled", false);
       }
-    } catch (e) {
-      console.error("SSE parse error:", e);
-    }
-  };
-}
+    });
+  }
 
 
-
-  btnZip.on("click", function () {
-    if (currentSessionId) {
-      window.location.href = `/download/${currentSessionId}`;
-    }
-  });
 });
